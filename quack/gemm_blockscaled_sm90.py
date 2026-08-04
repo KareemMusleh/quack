@@ -39,6 +39,8 @@ from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, t
 from quack.gemm_act import (
     GemmActMixin,
     GemmActSm90,
+    GemmGatedPostactQuantMixin,
+    GemmGatedPostactQuantSm90,
     GemmGatedSm90,
 )
 from quack.autotuner import autotune, AutotuneConfig
@@ -109,6 +111,7 @@ def _compile_mxfp8_gemm_act_sm90(
     d_dtype,
     c_dtype,
     postact_dtype,
+    postact_scale_dtype,
     a_major,
     b_major,
     d_major,
@@ -132,7 +135,11 @@ def _compile_mxfp8_gemm_act_sm90(
     epi_tile_n=None,
 ):
     is_gated = activation in gate_fn_map
-    GemmCls = GemmGatedSm90 if is_gated else GemmActSm90
+    GemmCls = (
+        GemmGatedPostactQuantSm90
+        if postact_scale_dtype is not None
+        else GemmGatedSm90 if is_gated else GemmActSm90
+    )
 
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
         a_dtype,
@@ -183,14 +190,33 @@ def _compile_mxfp8_gemm_act_sm90(
         else:
             return make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
 
-    epi_args = GemmCls.EpilogueArguments(
-        mAuxOut,
-        act_fn,
-        mRowVecBroadcast=mRowVec,
-        mColVecBroadcast=mColVec,
-        rounding_mode=0,  # RoundingMode.RN, Constexpr baked at compile time
-        sr_seed=fake_scalar(sr_seed_mode),
-    )
+    if postact_scale_dtype is not None:
+        assert is_gated and varlen_m
+        scale_n = cute.sym_int()
+        mScaleOut = fake_tensor(
+            postact_scale_dtype,
+            (m, scale_n),
+            leading_dim=0,
+            divisibility=1,
+        )
+        epi_args = GemmCls.EpilogueArguments(
+            mAuxOut,
+            mScaleOut,
+            act_fn,
+            mRowVecBroadcast=mRowVec,
+            mColVecBroadcast=mColVec,
+            rounding_mode=0,
+            sr_seed=fake_scalar(sr_seed_mode),
+        )
+    else:
+        epi_args = GemmCls.EpilogueArguments(
+            mAuxOut,
+            act_fn,
+            mRowVecBroadcast=mRowVec,
+            mColVecBroadcast=mColVec,
+            rounding_mode=0,  # RoundingMode.RN, Constexpr baked at compile time
+            sr_seed=fake_scalar(sr_seed_mode),
+        )
     scheduler_args = make_fake_scheduler_args(is_dynamic_persistent, False, l)
     varlen_args = make_fake_varlen_args(varlen_m, False, gather_A, m if varlen_m else None)
 
@@ -268,6 +294,7 @@ def mxfp8_gemm_act_dispatch_sm90(
     use_tma_gather: bool = False,
     concat_layout: tuple | None = None,
     epi_tile_n: int | None = None,
+    postact_scale: Optional[Tensor] = None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     gather_A = A_idx is not None
@@ -289,6 +316,9 @@ def mxfp8_gemm_act_dispatch_sm90(
     d_dtype = torch2cute_dtype_map[D.dtype] if D is not None else None
     c_dtype = torch2cute_dtype_map[C.dtype] if C is not None else None
     postact_dtype = torch2cute_dtype_map[PostAct.dtype]
+    postact_scale_dtype = (
+        torch2cute_dtype_map[postact_scale.dtype] if postact_scale is not None else None
+    )
     colvec_ndim = colvec_bias.ndim if colvec_bias is not None else 0
 
     device_capacity = get_device_capacity(A.device)
@@ -310,6 +340,7 @@ def mxfp8_gemm_act_dispatch_sm90(
         d_dtype,
         c_dtype,
         postact_dtype,
+        postact_scale_dtype,
         a_major,
         b_major,
         d_major,
@@ -333,14 +364,25 @@ def mxfp8_gemm_act_dispatch_sm90(
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    epi_args = GemmActMixin.EpilogueArguments(
-        PostAct_p,
-        None,  # act_fn is Constexpr, baked at compile time
-        mRowVecBroadcast=rowvec_bias,
-        mColVecBroadcast=colvec_bias,
-        rounding_mode=None,  # Constexpr, baked at compile time
-        sr_seed=None,
-    )
+    if postact_scale is not None:
+        epi_args = GemmGatedPostactQuantMixin.EpilogueArguments(
+            PostAct_p,
+            postact_scale,
+            None,  # act_fn is Constexpr, baked at compile time
+            mRowVecBroadcast=rowvec_bias,
+            mColVecBroadcast=colvec_bias,
+            rounding_mode=None,
+            sr_seed=None,
+        )
+    else:
+        epi_args = GemmActMixin.EpilogueArguments(
+            PostAct_p,
+            None,  # act_fn is Constexpr, baked at compile time
+            mRowVecBroadcast=rowvec_bias,
+            mColVecBroadcast=colvec_bias,
+            rounding_mode=None,  # Constexpr, baked at compile time
+            sr_seed=None,
+        )
     scheduler_args = make_scheduler_args(
         max_active_clusters, max_swizzle_size, tile_count_semaphore
     )
@@ -393,6 +435,7 @@ def mxfp8_gemm_gated_tuned_sm90(
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
     concat_layout: tuple | None = None,  # tensors whose non-contiguous dim is concat [gate; up]
+    postact_scale: Optional[Tensor] = None,
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -458,6 +501,45 @@ def mxfp8_gemm_gated_tuned_sm90(
         use_tma_gather=config.use_tma_gather,
         concat_layout=concat_layout,
         epi_tile_n=config.epi_tile_n,
+        postact_scale=postact_scale,
+    )
+
+
+def mxfp8_gemm_gated_postact_quant_sm90(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    preact_out: Tensor,
+    postact_out: Tensor,
+    postact_scale: Tensor,
+    cu_seqlens_m: Tensor,
+    *,
+    A_idx: Optional[Tensor] = None,
+    activation: GatedActivation = "swiglu",
+    config: GemmConfig,
+) -> None:
+    """Grouped MXFP8 GEMM with BF16 preact and 1x128 FP8 gated postact."""
+    assert config.tile_n == 256
+    assert config.epi_tile_n == 256
+    assert config.cluster_n == 1
+    assert preact_out.dtype == torch.bfloat16
+    assert postact_out.dtype == torch.float8_e4m3fn
+    assert postact_scale.dtype == torch.float32
+    assert postact_scale.shape == (postact_out.shape[0], postact_out.shape[1] // 128)
+    assert postact_scale.stride(0) == 1, "postact_scale must be M-contiguous (column-major)"
+    mxfp8_gemm_gated_tuned_sm90.fn(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        preact_out,
+        postact_out,
+        activation=activation,
+        cu_seqlens_m=cu_seqlens_m,
+        A_idx=A_idx,
+        config=config,
+        postact_scale=postact_scale,
     )
 
 

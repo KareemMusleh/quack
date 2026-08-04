@@ -34,6 +34,7 @@ from quack.rmsnorm_config import (
     prune_invalid_rmsnorm_bwd_configs,
     prune_invalid_rmsnorm_fwd_configs,
 )
+from quack.quant import blockwise_quant
 from cutlass.base_dsl.arch import Arch
 
 
@@ -477,7 +478,17 @@ def rmsnorm_fwd(
     residual_dtype: Optional[torch.dtype] = None,
     eps: float = 1e-6,
     store_rstd: bool = False,
-) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    quant_block_size: Optional[int] = None,
+) -> (
+    Tuple[Tensor, Tensor, Optional[Tensor]]
+    | Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]
+):
+    """RMSNorm forward, optionally followed by blockwise FP8 quantization.
+
+    When ``quant_block_size`` is provided, two additional tensors are returned:
+    the FP8-quantized normalized output and its M-contiguous dequantization
+    scales. This is the layout consumed by the SM90 blockscaled GEMMs.
+    """
     # Need to wrap to handle the case where residual_out is a alias of x, which makes torch.library
     # and torch.compile unhappy. Also allocate memory for out and residual_out if they are None
     # so that _layer_norm_fwd_impl doesn't have to return them.
@@ -496,6 +507,11 @@ def rmsnorm_fwd(
     # residual_out is None if residual is None and residual_dtype == input_dtype and dropout_p == 0.0
     if residual_out is None:
         residual_out = x
+    if quant_block_size is not None:
+        output_q, output_scale = blockwise_quant(
+            out, block_size=quant_block_size, scale_transpose=True
+        )
+        return out, residual_out, rstd, output_q, output_scale
     return out, residual_out, rstd
 
 

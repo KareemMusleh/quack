@@ -576,6 +576,29 @@ def test_rmsnorm_fwd_empty(store_rstd):
         assert rstd is None
 
 
+def test_rmsnorm_fwd_blockwise_quant():
+    """The optional FP8 result must represent the normalized output."""
+    M, N = 37, 1024
+    block_size = 128
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+
+    out, residual_out, rstd, output_q, output_scale = rmsnorm_fwd(
+        x, weight, eps=1e-6, quant_block_size=block_size
+    )
+
+    assert residual_out is x
+    assert rstd is None
+    assert output_q.shape == out.shape
+    assert output_q.dtype == torch.float8_e4m3fn
+    assert output_scale.shape == (M, N // block_size)
+    assert output_scale.dtype == torch.float32
+    assert output_scale.stride(0) == 1
+
+    dequant = output_q.float() * output_scale.repeat_interleave(block_size, dim=-1)
+    torch.testing.assert_close(dequant, out.float(), atol=0.125, rtol=0.125)
+
+
 @pytest.mark.parametrize("has_bias", [False, True])
 def test_rmsnorm_bwd_empty(has_bias):
     """rmsnorm_bwd must not launch a kernel when inputs have zero elements,

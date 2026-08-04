@@ -11,6 +11,8 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32, Float32, const_expr
 from cutlass.cute.runtime import make_ptr
 from cutlass.cute.nvgpu import warp
+from cutlass._mlir.dialects import arith, llvm
+from cutlass.cutlass_dsl import T
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import (
@@ -20,7 +22,15 @@ from quack.cute_dsl_utils import (
     torch2cute_dtype_map,
 )
 from quack.epi_composable import ComposableEpiMixin
-from quack.epi_ops import ColVecLoad, RowVecLoad, Scalar, TileStore
+from quack.epi_ops import (
+    ColVecLoad,
+    EpiOp,
+    RowVecLoad,
+    Scalar,
+    TileStore,
+    _get_lane_warp_layouts,
+)
+from quack.epi_utils import assume_stride_divisibility
 from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
@@ -295,6 +305,193 @@ class GemmGatedMixin(GemmActMixin):
 
 class GemmGatedSm90(GemmGatedMixin, GemmSm90):
     pass
+
+
+class _PostactScaleStore(EpiOp):
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        return {self.name: assume_stride_divisibility(getattr(args, self.name))}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        del smem_tensor
+        # The gated epilogue pairs adjacent preact columns. With a 256-wide
+        # epilogue tile, each pair tile is exactly one 128-wide postact quant block.
+        amax_preact = ctx.partition_for_epilogue_fn(
+            cute.make_rmem_tensor(
+                cute.make_layout((ctx.tile_M, ctx.tile_N), stride=(1, 0)),
+                Float32,
+            )
+        )
+        coords_preact = ctx.partition_for_epilogue_fn(
+            cute.make_identity_tensor((ctx.tile_M, ctx.tile_N))
+        )
+        lane_layout_mn, warp_layout_mn = _get_lane_warp_layouts(
+            ctx.tiled_copy_r2s, reference_src=True
+        )
+        lanes_in_n = cute.size(lane_layout_mn, mode=[1])
+        assert lanes_in_n == 1 << int(math.log2(lanes_in_n))
+        assert cute.size(warp_layout_mn[1]) == 1
+        return (
+            amax_preact,
+            coords_preact,
+            param,
+            ctx.tile_coord_mnkl,
+            ctx.varlen_manager,
+            lanes_in_n,
+        )
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        del gemm
+        amax, coords, param, tile_coord, varlen_manager, lanes_in_n = state
+        amax_cur = amax[None, None, None, epi_coord[0], epi_coord[1]]
+        coords_cur = coords[None, None, None, epi_coord[0], epi_coord[1]]
+        cute.filter_zeros(amax_cur).fill(0.0)
+        return (
+            amax_cur,
+            coords_cur,
+            param,
+            tile_coord,
+            varlen_manager,
+            lanes_in_n,
+        )
+
+
+class GemmGatedPostactQuantMixin(GemmGatedMixin):
+    _epi_ops = GemmGatedMixin._epi_ops + (_PostactScaleStore("mScaleOut"),)
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mAuxOut: cute.Tensor
+        mScaleOut: cute.Tensor
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+
+    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None):
+        assert args.mAuxOut.element_type.width == 8
+        assert self.cta_tile_shape_mnk[1] == 256
+        assert cute.size(self.epi_tile[1]) == 256
+        assert self.d_layout is None or self.d_layout.is_n_major_c()
+        assert cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut).is_n_major_c()
+        self.rounding_mode = args.rounding_mode
+        self.aux_out_dtype = args.mAuxOut.element_type
+        self.aux_out_layout = cutlass.utils.LayoutEnum.from_tensor(args.mAuxOut)
+        self.cta_tile_shape_aux_out_mn = (
+            self.cta_tile_shape_mnk[0],
+            self.cta_tile_shape_mnk[1] // 2,
+        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_fn"] = args.act_fn
+        for key in ("mRowVecBroadcast", "mColVecBroadcast"):
+            if key in self.concat_layout and key in d:
+                d[key] = layout_utils.concat_to_interleave(d[key], 1)
+        return self.EpilogueParams(**d)
+
+    @cute.jit
+    def epi_visit_subtile(
+        self,
+        params,
+        epi_loop_tensors,
+        tRS_rD: cute.Tensor,
+        tRS_rC: Optional[cute.Tensor] = None,
+    ) -> Tuple[cute.Tensor, ...]:
+        GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
+        tRS_rPostact_layout = cute.recast_layout(2, 1, tRS_rD.layout)
+        tRS_rPostact = cute.make_rmem_tensor(tRS_rPostact_layout.shape, self.acc_dtype)
+        tRS_rD_pair = cute.flat_divide(tRS_rD, cute.make_layout(2))
+        tRS_rGate = tRS_rD_pair[0, ...]
+        tRS_rUp = tRS_rD_pair[1, ...]
+        for i in cutlass.range(cute.size(tRS_rPostact), unroll_full=True):
+            tRS_rPostact[i] = params.act_fn(tRS_rGate[i], tRS_rUp[i])
+
+        # Match the standalone path exactly: quantization reads BF16 postact.
+        tRS_rPostact_bf16 = tRS_rPostact.to(cutlass.BFloat16)
+        tRS_rPostact = tRS_rPostact_bf16.to(self.acc_dtype)
+
+        amax, coords, scale_out, tile_coord, varlen_manager, lanes_in_n = epi_loop_tensors[
+            "mScaleOut"
+        ]
+        amax_pair = cute.flat_divide(amax, cute.make_layout(2))
+        amax_gate = amax_pair[0, ...]
+        for i in cutlass.range(cute.size(tRS_rPostact), unroll_full=True):
+            value = abs(tRS_rPostact[i])
+            amax_gate[i] = cute.arch.fmax(amax_gate[i], value)
+        amax_filtered = cute.filter_zeros(amax)
+        if const_expr(lanes_in_n > 1):
+            for i in cutlass.range(cute.size(amax_filtered), unroll_full=True):
+                amax_filtered[i] = cute.arch.warp_reduction(
+                    amax_filtered[i], cute.arch.fmax, threads_in_group=lanes_in_n
+                )
+
+        # Scaling a BF16 value by the exact power-of-two multiplier is itself
+        # exactly representable in BF16. Apply it before the SM90 STSM
+        # permutation so only the scaled values, not a second register tensor
+        # of per-value multipliers, need to cross the permutation.
+        coords_gate = cute.flat_divide(coords, cute.make_layout(2))[0, ...]
+        amax_m = layout_utils.convert_layout_zero_stride(
+            amax_gate, amax_gate.layout
+        )[None, 0]
+        coords_m = layout_utils.convert_layout_zero_stride(
+            coords_gate, amax_gate.layout
+        )[None, 0]
+        batch_idx = tile_coord[3]
+        limit_m = min(
+            varlen_manager.len_m(batch_idx) - tile_coord[0] * self.cta_tile_shape_mnk[0],
+            self.cta_tile_shape_mnk[0],
+        )
+        m_scale = cute.domain_offset(
+            (varlen_manager.params.cu_seqlens_m[batch_idx],),
+            scale_out[None, tile_coord[1]],
+        )
+        g_scale = cute.local_tile(m_scale, (self.cta_tile_shape_mnk[0],), (tile_coord[0],))
+        lane_leader = cute.arch.lane_idx() % lanes_in_n == 0
+        if lane_leader:
+            for m in cutlass.range(cute.size(coords_m, mode=[0]), unroll_full=True):
+                row = coords_m[m][0]
+                if row < limit_m:
+                    value = cute.arch.fmax(amax_m[m], Float32(1e-5))
+                    qscale = Float32(448.0) / value
+                    scale_bits = llvm.bitcast(T.i32(), qscale) & 0xFF800000
+                    qscale = arith.bitcast(T.f32(), scale_bits)
+                    g_scale[row] = Float32(1.0) / qscale
+        for i in cutlass.range(cute.size(tRS_rPostact), unroll_full=True):
+            value = cute.arch.fmax(amax_gate[i], Float32(1e-5))
+            qscale = Float32(448.0) / value
+            scale_bits = llvm.bitcast(T.i32(), qscale) & 0xFF800000
+            qscale = arith.bitcast(T.f32(), scale_bits)
+            tRS_rPostact[i] *= qscale
+        tRS_rPostact_bf16 = tRS_rPostact.to(cutlass.BFloat16)
+        permute_gated_Cregs_b16(tRS_rPostact_bf16)
+        tRS_rPostact = tRS_rPostact_bf16.to(self.acc_dtype)
+
+        return (tRS_rPostact,)
+
+    @cute.jit
+    def epi_convert_aux_out(
+        self,
+        output_idx: cutlass.Constexpr[int],
+        tRS_rAuxOut,
+        sr_seed,
+        tidx,
+        tile_coord_mnkl,
+        num_prev_subtiles,
+        epi_idx,
+    ):
+        del output_idx, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        return tRS_rAuxOut.to(self.aux_out_dtype)
+
+
+class GemmGatedPostactQuantSm90(GemmGatedPostactQuantMixin, GemmSm90):
+    _prefer_epi_registers = True
+    _epi_stage_override = 1
 
 
 class GemmGatedSm80(GemmGatedMixin, GemmSm80):

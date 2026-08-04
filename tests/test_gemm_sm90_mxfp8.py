@@ -7,10 +7,14 @@ from quack.gemm_blockscaled_sm90 import (
     _SF_VEC_SIZE_SM90 as SF,
     _WEIGHT_BLOCK_N_SM90 as BN,
     mxfp8_gemm_act,
+    mxfp8_gemm_gated_postact_quant_sm90,
+    mxfp8_gemm_gated_tuned_sm90,
     quantize_act,
     quantize_weight_sm90,
 )
+from quack.gemm_config import GemmConfig
 from quack.gemm_interface import gemm_act
+from quack.quant import _blockwise_quant, grouped_scale_to_dqaccum
 
 
 def _skip_if_not_sm90():
@@ -142,3 +146,77 @@ def test_mxfp8_gemm_sm90_batched(M, K, N, activation, store_preact):
         _assert_cos_close(preact, pre_ref, "preact")
     else:
         assert preact is None
+
+
+def test_mxfp8_grouped_gated_postact_quant_is_bitwise_identical():
+    _skip_if_not_sm90()
+    torch.manual_seed(20260723)
+    device = torch.device("cuda")
+    lengths = (192, 128)
+    rows, k, postact_n = sum(lengths), 256, 256
+    experts = len(lengths)
+    cu = torch.tensor((0, lengths[0], rows), device=device, dtype=torch.int32)
+    source = torch.randn((rows, k), device=device, dtype=torch.bfloat16) / math.sqrt(k)
+    weight = (
+        torch.randn(
+            (experts, 2 * postact_n, k), device=device, dtype=torch.bfloat16
+        )
+        / math.sqrt(k)
+    )
+    qa, dense_sfa = quantize_act(source)
+    qb, sfb = quantize_weight_sm90(weight)
+    sfa = grouped_scale_to_dqaccum(dense_sfa, cu)
+
+    preact_ref = torch.empty((rows, 2 * postact_n), device=device, dtype=torch.bfloat16)
+    postact_bf16 = torch.empty((rows, postact_n), device=device, dtype=torch.bfloat16)
+    qpostact_ref = torch.empty_like(postact_bf16, dtype=torch.float8_e4m3fn)
+    scale_ref = torch.empty((rows, postact_n // 128), device=device, dtype=torch.float32)
+    baseline_config = GemmConfig(
+        tile_m=128,
+        tile_n=256,
+        epi_tile_n=128,
+        cluster_m=2,
+        cluster_n=1,
+        pingpong=False,
+        is_dynamic_persistent=False,
+    )
+    mxfp8_gemm_gated_tuned_sm90.fn(
+        qa,
+        qb.mT,
+        sfa,
+        sfb.mT,
+        preact_ref,
+        postact_bf16,
+        activation="swiglu",
+        cu_seqlens_m=cu,
+        config=baseline_config,
+    )
+    _blockwise_quant(postact_bf16, qpostact_ref, scale_ref, None, 128)
+
+    preact = torch.empty_like(preact_ref)
+    qpostact = torch.empty_like(qpostact_ref)
+    scale = torch.empty_like(scale_ref)
+    fused_config = GemmConfig(
+        tile_m=128,
+        tile_n=256,
+        epi_tile_n=256,
+        cluster_m=2,
+        cluster_n=1,
+        pingpong=False,
+        is_dynamic_persistent=False,
+    )
+    mxfp8_gemm_gated_postact_quant_sm90(
+        qa,
+        qb.mT,
+        sfa,
+        sfb.mT,
+        preact,
+        qpostact,
+        scale,
+        cu,
+        config=fused_config,
+    )
+
+    assert torch.equal(preact, preact_ref)
+    assert torch.equal(qpostact, qpostact_ref)
+    assert torch.equal(scale, scale_ref)

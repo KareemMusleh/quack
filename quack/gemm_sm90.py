@@ -17,6 +17,8 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 import cutlass.utils.hopper_helpers as sm90_utils
 from cutlass import Int32, Float32, Float16, Boolean, const_expr
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 from cutlass.utils import LayoutEnum, SmemPartition
 
 
@@ -29,6 +31,46 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.pipeline import PipelineAsync as QuackPipelineAsync, make_pipeline_state
 import quack.copy_utils as copy_utils
 import quack.sm90_utils as quack_sm90_utils
+
+
+@dsl_user_op
+def _mul_rn_f32(a: Float32, b: Float32, *, loc=None, ip=None) -> Float32:
+    """Emit an opaque FP32 multiply so promotion scales stay precombined."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+            ],
+            "mul.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def _fma_rn_f32(a: Float32, b: Float32, c: Float32, *, loc=None, ip=None) -> Float32:
+    """Emit one FP32 fused multiply-add for block-scale promotion."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                Float32(c).ir_value(loc=loc, ip=ip),
+            ],
+            "fma.rn.f32 $0, $1, $2, $3;",
+            "=f,f,f,f",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -265,7 +307,11 @@ class GemmSm90(GemmTmaBase):
             if self.mma_warp_groups == 3:
                 self.num_regs_load, self.num_regs_mma = 56, 152
             else:
-                self.num_regs_load, self.num_regs_mma = (56, 224)
+                self.num_regs_load, self.num_regs_mma = (
+                    (40, 232)
+                    if getattr(self, "_prefer_epi_registers", False)
+                    else (56, 224)
+                )
 
         self.ab_stage = None
         self.epi_stage = None
@@ -1412,13 +1458,23 @@ class GemmSm90(GemmTmaBase):
         uniform_scale = const_expr(
             self.weight_n_block % frag_n == 0 and tile_n % self.weight_n_block == 0
         )
+        if const_expr(not uniform_scale):
+            # Tile starts visit offsets spaced by gcd(tile_n, sf_block_n). This gives
+            # compile-time lower/upper bounds for the number of leading N cores using b0.
+            # Only cores between these bounds need a runtime boundary predicate.
+            min_former_core = const_expr(
+                min(frag_n, math.gcd(tile_n, sf_block_n)) // 8
+            )
+            max_former_core = const_expr(min(frag_n, sf_block_n) // 8)
+            alignment_period = const_expr(
+                sf_block_n // math.gcd(tile_n, sf_block_n)
+            )
         if const_expr(uniform_scale):
             # scales[0]/scales[1]: (m0, m1) row-pair scale for the fragment's single block.
             scales = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
         else:
-            # sa: (m0, m1) row-pair A scale. sb_g: per-N-core weight scale (predicate).
-            sa = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
-            sb_g = cute.make_rmem_tensor(cute.make_layout((G_N,)), acc.dtype)
+            scales_b0 = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
+            scales_b1 = cute.make_rmem_tensor(cute.make_layout((2,)), acc.dtype)
         for k_tile in cutlass.range(k_tile_cnt, unroll=8):
             peek_full = ab_pipeline.consumer_try_wait(ab_read_state)
             ab_pipeline.consumer_wait(ab_read_state, peek_full)
@@ -1428,9 +1484,6 @@ class GemmSm90(GemmTmaBase):
                 scale_a0 = sSFA[m0 + m_off, 0, stage]
                 scale_a1 = sSFA[m1 + m_off, 0, stage]
                 curr_tCrA = layout_utils.expand(tCrA[None, m_idx, None, None], dim=1, size=1)
-                if const_expr(not uniform_scale):
-                    sa[0] = scale_a0
-                    sa[1] = scale_a1
                 for n_idx in cutlass.range_constexpr(MMA_N):
                     curr_tCrB = layout_utils.expand(tCrB[None, n_idx, None, None], dim=1, size=1)
                     # acc[m_idx, n_idx] reshaped to a single ((2,2,G_N),1,1) fragment.
@@ -1471,19 +1524,21 @@ class GemmSm90(GemmTmaBase):
                         )
                         num_former = cutlass.min(Int32(frag_n), Int32(sf_block_n) - off)
                         if const_expr(not self.pingpong):
-                            # Map global blocks to tile-local staging slots (same base_blk
-                            # the loop-top staging used: (n_tile_coord*tile_n)//sf_block_n).
-                            base_blk = n_tile_coord * Int32(tile_n) // Int32(sf_block_n)
-                            sb0 = sSFB[b0 - base_blk, k_tile]
-                            sb1 = sSFB[b1 - base_blk, k_tile]
+                            # Both possibly-needed blocks were staged in tile-local order.
+                            # The second slot is clamped to the first block on a partial tail.
+                            sb0 = sSFB[0, k_tile]
+                            sb1 = sSFB[1, k_tile]
                         else:
                             sb0 = mSFB_nk[b0, k_tile]
                             sb1 = mSFB_nk[b1, k_tile]
-                        for g in cutlass.range_constexpr(G_N):
-                            # Branch-free select: sb0 if this core is before the block
-                            # boundary, else sb1 (== sb0 when the fragment doesn't cross).
-                            in_former = (Int32(g * 8) < num_former).to(cutlass.Float32)
-                            sb_g[g] = sb1 + (sb0 - sb1) * in_former
+                        scales_b0[0] = _mul_rn_f32(scale_a0, sb0)
+                        scales_b0[1] = _mul_rn_f32(scale_a1, sb0)
+                        scales_b1[0] = _mul_rn_f32(scale_a0, sb1)
+                        scales_b1[1] = _mul_rn_f32(scale_a1, sb1)
+                        if const_expr(alignment_period == 2):
+                            tile_is_block_aligned = (
+                                n_tile_coord % Int32(alignment_period) == 0
+                            )
                     mma_fn(
                         tCrA=curr_tCrA,
                         tCrB=curr_tCrB,
@@ -1499,19 +1554,32 @@ class GemmSm90(GemmTmaBase):
                             self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
 
                     if const_expr(not uniform_scale):
-                        # scale = A row scale (sa, selected by the mode-0 row axis) times the
-                        # per-core weight scale (sb_g, selected by the mode-0 core axis G_N).
-                        sa_bcast = cute.make_tensor(
-                            sa.iterator,
-                            cute.make_layout(acc_slow.shape, stride=((0, 1, 0), 0, 0)),
-                        )
-                        sb_bcast = cute.make_tensor(
-                            sb_g.iterator,
-                            cute.make_layout(acc_slow.shape, stride=((0, 0, 1), 0, 0)),
-                        )
-                        curr_acc.store(
-                            curr_acc.load() + acc_slow.load() * sa_bcast.load() * sb_bcast.load()
-                        )
+                        # Cores before/after the compile-time boundary range always use
+                        # b0/b1 respectively. Only the cores whose scale depends on this
+                        # tile's starting offset need a runtime predicate.
+                        for g in cutlass.range_constexpr(G_N):
+                            for row in cutlass.range_constexpr(2):
+                                if const_expr(g < min_former_core):
+                                    selected_scale = scales_b0[row]
+                                elif const_expr(g >= max_former_core):
+                                    selected_scale = scales_b1[row]
+                                elif const_expr(alignment_period == 2):
+                                    selected_scale = (
+                                        scales_b0[row]
+                                        if tile_is_block_aligned
+                                        else scales_b1[row]
+                                    )
+                                else:
+                                    selected_scale = (
+                                        scales_b0[row]
+                                        if Int32(g * 8) < num_former
+                                        else scales_b1[row]
+                                    )
+                                for col in cutlass.range_constexpr(2):
+                                    coord = ((col, row, g), 0, 0)
+                                    curr_acc[coord] = _fma_rn_f32(
+                                        acc_slow[coord], selected_scale, curr_acc[coord]
+                                    )
                     else:
                         # Broadcast scales over the fragment: only the mode-0 row axis
                         # selects scales[0] (m0) vs scales[1] (m1).
@@ -1669,7 +1737,9 @@ class GemmSm90(GemmTmaBase):
         :rtype: Tuple[int, int]
         """
 
-        epi_stage = 4 if epi_tile[1] <= 16 else 2
+        epi_stage = getattr(cls, "_epi_stage_override", None)
+        if epi_stage is None:
+            epi_stage = 4 if epi_tile[1] <= 16 else 2
         epi_smem_bytes = cls.epi_smem_bytes(
             epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
         )
