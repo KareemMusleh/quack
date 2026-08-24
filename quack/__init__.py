@@ -19,6 +19,7 @@ from quack.rmsnorm import rmsnorm  # noqa: E402
 from quack.softmax import softmax  # noqa: E402
 from quack.cross_entropy import cross_entropy  # noqa: E402
 from quack.rounding import RoundingMode  # noqa: E402
+from quack.selective_radix import selective_radix  # noqa: E402
 
 
 __all__ = [
@@ -26,4 +27,5 @@ __all__ = [
     "softmax",
     "cross_entropy",
     "RoundingMode",
+    "selective_radix",
 ]
